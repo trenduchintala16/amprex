@@ -743,16 +743,20 @@ void shader_core_stats::print(FILE *fout) const {
   unsigned long long total_none = 0;
   unsigned long long total_medium = 0;
   unsigned long long total_large = 0;
+  unsigned long long total_switch_delay_cycles = 0;
 
   for (unsigned i = 0; i < m_config->gpgpu_num_sched_per_core; i++) {
       total_none += rank_switch_none[i];
       total_medium += rank_switch_medium[i];
       total_large += rank_switch_large[i];
+      total_switch_delay_cycles += rank_switch_delay_cycles[i];
   }
 
   fprintf(fout, "rank_switch_none = %llu\n", total_none);
   fprintf(fout, "rank_switch_medium = %llu\n", total_medium);
   fprintf(fout, "rank_switch_large = %llu\n", total_large);
+  fprintf(fout, "rank_switch_delay_cycles = %llu\n",
+          total_switch_delay_cycles);
   
 
   unsigned long long total_medium_dist = 0, total_medium_cnt = 0;
@@ -1618,10 +1622,12 @@ void scheduler_unit::do_on_warp_issued(
 
     if (sw == SwitchType::MEDIUM) {
       m_stats->rank_switch_medium[m_id]++;
+      m_stats->rank_switch_delay_cycles[m_id] += kMediumSwitchDelayCycles;
       m_stats->medium_switch_distance_sum[m_id] += m_cluster_run_len;
       m_stats->medium_switch_count[m_id]++;
     } else if (sw == SwitchType::LARGE) {
       m_stats->rank_switch_large[m_id]++;
+      m_stats->rank_switch_delay_cycles[m_id] += kLargeSwitchDelayCycles;
       m_stats->large_switch_distance_sum[m_id] += m_cluster_run_len;
       m_stats->large_switch_count[m_id]++;
     }

@@ -24,6 +24,9 @@ enum class SwitchType : uint8_t {
     LARGE = 2
 };
 
+static constexpr unsigned kMediumSwitchDelayCycles = 10;
+static constexpr unsigned kLargeSwitchDelayCycles = 20;
+
 // Opcode -> rank mapping for Turing / sm_75 traces.
 // This is intentionally conservative: many instructions are grouped by
 // functional class rather than trying to overfit per-opcode power.

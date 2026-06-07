@@ -400,6 +400,9 @@ class scheduler_unit {  // this can be copied freely, so can be used in std
         m_spec_cores_out(spec_cores_out),
         m_prev_rank(InstrRank::UNKNOWN),
         m_has_prev_rank(false),
+        m_prev_cluster(-1),
+        m_cluster_run_len(0),
+        m_has_prev_cluster(false),
         m_id(id) {}
   virtual ~scheduler_unit() {}
   virtual void add_supervised_warp_id(int i) {
@@ -1949,6 +1952,9 @@ class shader_core_stats : public shader_core_stats_pod {
                                                       sizeof(unsigned long long));
     rank_switch_large = (unsigned long long *)calloc(config->gpgpu_num_sched_per_core,
                                                     sizeof(unsigned long long));
+    rank_switch_delay_cycles =
+        (unsigned long long *)calloc(config->gpgpu_num_sched_per_core,
+                                     sizeof(unsigned long long));
 
     medium_switch_distance_sum = (unsigned long long *)calloc(config->gpgpu_num_sched_per_core,
                         sizeof(unsigned long long));
@@ -2016,6 +2022,7 @@ class shader_core_stats : public shader_core_stats_pod {
     free(rank_switch_none);
     free(rank_switch_medium);
     free(rank_switch_large);
+    free(rank_switch_delay_cycles);
     free(medium_switch_distance_sum);
     free(medium_switch_count);
     free(large_switch_distance_sum);
@@ -2055,6 +2062,7 @@ class shader_core_stats : public shader_core_stats_pod {
   unsigned long long *rank_switch_none;
   unsigned long long *rank_switch_medium;
   unsigned long long *rank_switch_large;
+  unsigned long long *rank_switch_delay_cycles;
 
   unsigned long long *medium_switch_distance_sum;
   unsigned long long *medium_switch_count;
