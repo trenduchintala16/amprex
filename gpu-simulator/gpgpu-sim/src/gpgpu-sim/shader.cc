@@ -193,6 +193,8 @@ void shader_core_ctx::create_schedulers() {
   std::string sched_config = m_config->gpgpu_scheduler_string;
   const concrete_scheduler scheduler =
       sched_config.find("lrr") != std::string::npos ? CONCRETE_SCHEDULER_LRR
+      : sched_config.find("amprex") != std::string::npos
+          ? CONCRETE_SCHEDULER_AMPREX
       : sched_config.find("two_level_active") != std::string::npos
           ? CONCRETE_SCHEDULER_TWO_LEVEL_ACTIVE
       : sched_config.find("gto") != std::string::npos ? CONCRETE_SCHEDULER_GTO
@@ -224,6 +226,14 @@ void shader_core_ctx::create_schedulers() {
         break;
       case CONCRETE_SCHEDULER_GTO:
         schedulers.push_back(new gto_scheduler(
+            m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
+            &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
+            &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
+            &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
+            &m_pipeline_reg[ID_OC_MEM], i));
+        break;
+      case CONCRETE_SCHEDULER_AMPREX:
+        schedulers.push_back(new amprex_scheduler(
             m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
             &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
             &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
@@ -1670,6 +1680,49 @@ void gto_scheduler::order_warps() {
                     m_last_supervised_issued, m_supervised_warps.size(),
                     ORDERING_GREEDY_THEN_PRIORITY_FUNC,
                     scheduler_unit::sort_warps_by_oldest_dynamic_id);
+}
+
+void amprex_scheduler::order_warps() {
+  std::vector<shd_warp_t *> lrr_order;
+  order_lrr(lrr_order, m_supervised_warps, m_last_supervised_issued,
+            m_supervised_warps.size());
+
+  m_next_cycle_prioritized_warps.clear();
+
+  // fallback to LRR if there is no instruction from the previous cluster or the previous cluster is invalid
+  if (!m_has_prev_cluster || m_prev_cluster < 0) {
+    m_next_cycle_prioritized_warps = lrr_order;
+    return;
+  }
+
+  for (std::vector<shd_warp_t *>::const_iterator iter = lrr_order.begin();
+       iter != lrr_order.end(); ++iter) {
+    shd_warp_t *candidate_warp = *iter;
+    if (candidate_warp == NULL || candidate_warp->done_exit() ||
+        candidate_warp->waiting() || candidate_warp->ibuffer_empty()) {
+      continue;
+    }
+
+    const warp_inst_t *inst = candidate_warp->ibuffer_next_inst();
+    if (inst && cluster_of(inst->rank) == m_prev_cluster) {
+      m_next_cycle_prioritized_warps.push_back(candidate_warp);
+    }
+  }
+
+  for (std::vector<shd_warp_t *>::const_iterator iter = lrr_order.begin();
+       iter != lrr_order.end(); ++iter) {
+    shd_warp_t *candidate_warp = *iter;
+    if (candidate_warp == NULL || candidate_warp->done_exit() ||
+        candidate_warp->waiting() || candidate_warp->ibuffer_empty()) {
+      m_next_cycle_prioritized_warps.push_back(candidate_warp);
+      continue;
+    }
+
+    const warp_inst_t *inst = candidate_warp->ibuffer_next_inst();
+    if (!inst || cluster_of(inst->rank) != m_prev_cluster) {
+      m_next_cycle_prioritized_warps.push_back(candidate_warp);
+    }
+  }
 }
 
 void oldest_scheduler::order_warps() {
@@ -4339,9 +4392,13 @@ bool opndcoll_rfu_t::writeback(warp_inst_t &inst) {
 }
 
 void opndcoll_rfu_t::dispatch_ready_cu() {
+  bool amprex_scheduler =
+      std::string(m_shader->get_config()->gpgpu_scheduler_string)
+          .find("amprex") != std::string::npos;
   for (unsigned p = 0; p < m_dispatch_units.size(); ++p) {
     dispatch_unit_t &du = m_dispatch_units[p];
-    collector_unit_t *cu = du.find_ready();
+    collector_unit_t *cu =
+        amprex_scheduler ? du.find_ready_amprex() : du.find_ready();
     if (cu) {
       for (unsigned i = 0; i < (cu->get_num_operands() - cu->get_num_regs());
            i++) {

@@ -372,6 +372,7 @@ enum concrete_scheduler {
   CONCRETE_SCHEDULER_RRR,
   CONCRETE_SCHEDULER_WARP_LIMITING,
   CONCRETE_SCHEDULER_OLDEST_FIRST,
+  CONCRETE_SCHEDULER_AMPREX,
   NUM_CONCRETE_SCHEDULERS
 };
 
@@ -558,6 +559,25 @@ class gto_scheduler : public scheduler_unit {
   virtual void order_warps();
   virtual void done_adding_supervised_warps() {
     m_last_supervised_issued = m_supervised_warps.begin();
+  }
+};
+
+class amprex_scheduler : public scheduler_unit {
+ public:
+  amprex_scheduler(shader_core_stats *stats, shader_core_ctx *shader,
+                   Scoreboard *scoreboard, simt_stack **simt,
+                   std::vector<shd_warp_t *> *warp, register_set *sp_out,
+                   register_set *dp_out, register_set *sfu_out,
+                   register_set *int_out, register_set *tensor_core_out,
+                   std::vector<register_set *> &spec_cores_out,
+                   register_set *mem_out, int id)
+      : scheduler_unit(stats, shader, scoreboard, simt, warp, sp_out, dp_out,
+                       sfu_out, int_out, tensor_core_out, spec_cores_out,
+                       mem_out, id) {}
+  virtual ~amprex_scheduler() {}
+  virtual void order_warps();
+  virtual void done_adding_supervised_warps() {
+    m_last_supervised_issued = m_supervised_warps.end();
   }
 };
 
@@ -979,6 +999,7 @@ class opndcoll_rfu_t {  // operand collector based register file unit
     void collect_operand(unsigned op) { m_not_ready.reset(op); }
     unsigned get_num_operands() const { return m_warp->get_num_operands(); }
     unsigned get_num_regs() const { return m_warp->get_num_regs(); }
+    int get_cluster() const { return cluster_of(m_warp->rank); }
     void dispatch();
     bool is_free() { return m_free; }
 
@@ -1006,6 +1027,8 @@ class opndcoll_rfu_t {  // operand collector based register file unit
       m_collector_units = cus;
       m_num_collectors = (*cus).size();
       m_next_cu = 0;
+      m_prev_cluster = -1;
+      m_has_prev_cluster = false;
     }
     void init(bool sub_core_model, unsigned num_warp_scheds) {
       m_sub_core_model = sub_core_model;
@@ -1028,6 +1051,30 @@ class opndcoll_rfu_t {  // operand collector based register file unit
       return NULL;
     }
 
+    collector_unit_t *find_ready_amprex() {
+      if (m_has_prev_cluster && m_prev_cluster >= 0) {
+        unsigned cusPerSched = m_num_collectors / m_num_warp_scheds;
+        unsigned rr_increment =
+            m_sub_core_model ? cusPerSched - (m_last_cu % cusPerSched) : 1;
+        for (unsigned n = 0; n < m_num_collectors; n++) {
+          unsigned c = (m_last_cu + n + rr_increment) % m_num_collectors;
+          if ((*m_collector_units)[c].ready() &&
+              (*m_collector_units)[c].get_cluster() == m_prev_cluster) {
+            m_last_cu = c;
+            m_prev_cluster = (*m_collector_units)[c].get_cluster();
+            return &((*m_collector_units)[c]);
+          }
+        }
+      }
+
+      collector_unit_t *cu = find_ready();
+      if (cu) {
+        m_prev_cluster = cu->get_cluster();
+        m_has_prev_cluster = true;
+      }
+      return cu;
+    }
+
    private:
     unsigned m_num_collectors;
     std::vector<collector_unit_t> *m_collector_units;
@@ -1035,6 +1082,8 @@ class opndcoll_rfu_t {  // operand collector based register file unit
     unsigned m_next_cu;  // for initialization
     bool m_sub_core_model;
     unsigned m_num_warp_scheds;
+    int m_prev_cluster;
+    bool m_has_prev_cluster;
   };
 
   // opndcoll_rfu_t data members
