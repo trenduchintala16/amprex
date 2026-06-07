@@ -27,6 +27,17 @@ enum class SwitchType : uint8_t {
 static constexpr unsigned kMediumSwitchDelayCycles = 10;
 static constexpr unsigned kLargeSwitchDelayCycles = 20;
 
+inline unsigned base_switch_delay_cycles(SwitchType sw) {
+    switch (sw) {
+        case SwitchType::MEDIUM:
+            return kMediumSwitchDelayCycles;
+        case SwitchType::LARGE:
+            return kLargeSwitchDelayCycles;
+        default:
+            return 0;
+    }
+}
+
 // Opcode -> rank mapping for Turing / sm_75 traces.
 // This is intentionally conservative: many instructions are grouped by
 // functional class rather than trying to overfit per-opcode power.
@@ -143,6 +154,13 @@ inline int cluster_of(InstrRank r) {
         default:
             return -1;
     }
+}
+
+inline unsigned cluster_distance(int prev_cluster, int curr_cluster) {
+    if (prev_cluster < 0 || curr_cluster < 0) return 3;
+    return (prev_cluster > curr_cluster)
+               ? (unsigned)(prev_cluster - curr_cluster)
+               : (unsigned)(curr_cluster - prev_cluster);
 }
 
 inline SwitchType classify_switch(InstrRank prev, InstrRank curr) {

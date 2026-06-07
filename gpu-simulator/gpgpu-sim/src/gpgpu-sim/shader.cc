@@ -193,6 +193,9 @@ void shader_core_ctx::create_schedulers() {
   std::string sched_config = m_config->gpgpu_scheduler_string;
   const concrete_scheduler scheduler =
       sched_config.find("lrr") != std::string::npos ? CONCRETE_SCHEDULER_LRR
+      : sched_config.find("amprex_lookahead") != std::string::npos ||
+              sched_config.find("amprex-lookahead") != std::string::npos
+          ? CONCRETE_SCHEDULER_AMPREX_LOOKAHEAD
       : sched_config.find("amprex") != std::string::npos
           ? CONCRETE_SCHEDULER_AMPREX
       : sched_config.find("two_level_active") != std::string::npos
@@ -234,6 +237,14 @@ void shader_core_ctx::create_schedulers() {
         break;
       case CONCRETE_SCHEDULER_AMPREX:
         schedulers.push_back(new amprex_scheduler(
+            m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
+            &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
+            &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
+            &m_pipeline_reg[ID_OC_TENSOR_CORE], m_specilized_dispatch_reg,
+            &m_pipeline_reg[ID_OC_MEM], i));
+        break;
+      case CONCRETE_SCHEDULER_AMPREX_LOOKAHEAD:
+        schedulers.push_back(new amprex_lookahead_scheduler(
             m_stats, this, m_scoreboard, m_simt_stack, &m_warp,
             &m_pipeline_reg[ID_OC_SP], &m_pipeline_reg[ID_OC_DP],
             &m_pipeline_reg[ID_OC_SFU], &m_pipeline_reg[ID_OC_INT],
@@ -754,17 +765,25 @@ void shader_core_stats::print(FILE *fout) const {
   unsigned long long total_medium = 0;
   unsigned long long total_large = 0;
   unsigned long long total_switch_delay_cycles = 0;
+  unsigned long long total_switch_base_delay_cycles = 0;
+  unsigned long long total_switch_hidden_delay_cycles = 0;
 
   for (unsigned i = 0; i < m_config->gpgpu_num_sched_per_core; i++) {
       total_none += rank_switch_none[i];
       total_medium += rank_switch_medium[i];
       total_large += rank_switch_large[i];
       total_switch_delay_cycles += rank_switch_delay_cycles[i];
+      total_switch_base_delay_cycles += rank_switch_base_delay_cycles[i];
+      total_switch_hidden_delay_cycles += rank_switch_hidden_delay_cycles[i];
   }
 
   fprintf(fout, "rank_switch_none = %llu\n", total_none);
   fprintf(fout, "rank_switch_medium = %llu\n", total_medium);
   fprintf(fout, "rank_switch_large = %llu\n", total_large);
+  fprintf(fout, "rank_switch_base_delay_cycles = %llu\n",
+          total_switch_base_delay_cycles);
+  fprintf(fout, "rank_switch_hidden_delay_cycles = %llu\n",
+          total_switch_hidden_delay_cycles);
   fprintf(fout, "rank_switch_delay_cycles = %llu\n",
           total_switch_delay_cycles);
   
@@ -1612,6 +1631,34 @@ void scheduler_unit::cycle() {
     m_stats->shader_cycle_distro[2]++;  // pipeline stalled
 }
 
+unsigned scheduler_unit::get_switch_delay_cycles(SwitchType sw,
+                                                 int prev_cluster,
+                                                 int curr_cluster,
+                                                 unsigned long long run_len,
+                                                 unsigned *hidden_cycles) const {
+  (void)prev_cluster;
+  (void)curr_cluster;
+  (void)run_len;
+  if (hidden_cycles) *hidden_cycles = 0;
+  return base_switch_delay_cycles(sw);
+}
+
+unsigned amprex_lookahead_scheduler::get_switch_delay_cycles(
+    SwitchType sw, int prev_cluster, int curr_cluster,
+    unsigned long long run_len, unsigned *hidden_cycles) const {
+  unsigned base_delay_cycles = base_switch_delay_cycles(sw);
+  unsigned hidden = 0;
+
+  if (prev_cluster >= 0 && curr_cluster > prev_cluster &&
+      base_delay_cycles > 0) {
+    hidden = (run_len < base_delay_cycles) ? (unsigned)run_len
+                                           : base_delay_cycles;
+  }
+
+  if (hidden_cycles) *hidden_cycles = hidden;
+  return base_delay_cycles - hidden;
+}
+
 void scheduler_unit::do_on_warp_issued(
   unsigned warp_id, unsigned num_issued,
   const std::vector<shd_warp_t *>::const_iterator &prioritized_iter,
@@ -1629,18 +1676,24 @@ void scheduler_unit::do_on_warp_issued(
     m_stats->rank_switch_none[m_id]++;
   } else {
     SwitchType sw = classify_switch(m_prev_rank, curr_rank);
+    unsigned hidden_delay_cycles = 0;
+    unsigned base_delay_cycles = base_switch_delay_cycles(sw);
+    unsigned delay_cycles = get_switch_delay_cycles(
+        sw, m_prev_cluster, curr_cluster, m_cluster_run_len,
+        &hidden_delay_cycles);
 
     if (sw == SwitchType::MEDIUM) {
       m_stats->rank_switch_medium[m_id]++;
-      m_stats->rank_switch_delay_cycles[m_id] += kMediumSwitchDelayCycles;
       m_stats->medium_switch_distance_sum[m_id] += m_cluster_run_len;
       m_stats->medium_switch_count[m_id]++;
     } else if (sw == SwitchType::LARGE) {
       m_stats->rank_switch_large[m_id]++;
-      m_stats->rank_switch_delay_cycles[m_id] += kLargeSwitchDelayCycles;
       m_stats->large_switch_distance_sum[m_id] += m_cluster_run_len;
       m_stats->large_switch_count[m_id]++;
     }
+    m_stats->rank_switch_base_delay_cycles[m_id] += base_delay_cycles;
+    m_stats->rank_switch_hidden_delay_cycles[m_id] += hidden_delay_cycles;
+    m_stats->rank_switch_delay_cycles[m_id] += delay_cycles;
 
     m_prev_cluster = curr_cluster;
     m_cluster_run_len = 1;
@@ -1689,38 +1742,27 @@ void amprex_scheduler::order_warps() {
 
   m_next_cycle_prioritized_warps.clear();
 
-  // fallback to LRR if there is no instruction from the previous cluster or the previous cluster is invalid
   if (!m_has_prev_cluster || m_prev_cluster < 0) {
     m_next_cycle_prioritized_warps = lrr_order;
     return;
   }
 
-  for (std::vector<shd_warp_t *>::const_iterator iter = lrr_order.begin();
-       iter != lrr_order.end(); ++iter) {
-    shd_warp_t *candidate_warp = *iter;
-    if (candidate_warp == NULL || candidate_warp->done_exit() ||
-        candidate_warp->waiting() || candidate_warp->ibuffer_empty()) {
-      continue;
-    }
-
-    const warp_inst_t *inst = candidate_warp->ibuffer_next_inst();
-    if (inst && cluster_of(inst->rank) == m_prev_cluster) {
-      m_next_cycle_prioritized_warps.push_back(candidate_warp);
-    }
-  }
-
-  for (std::vector<shd_warp_t *>::const_iterator iter = lrr_order.begin();
-       iter != lrr_order.end(); ++iter) {
-    shd_warp_t *candidate_warp = *iter;
-    if (candidate_warp == NULL || candidate_warp->done_exit() ||
-        candidate_warp->waiting() || candidate_warp->ibuffer_empty()) {
-      m_next_cycle_prioritized_warps.push_back(candidate_warp);
-      continue;
-    }
-
-    const warp_inst_t *inst = candidate_warp->ibuffer_next_inst();
-    if (!inst || cluster_of(inst->rank) != m_prev_cluster) {
-      m_next_cycle_prioritized_warps.push_back(candidate_warp);
+  for (unsigned distance = 0; distance <= 3; distance++) {
+    for (std::vector<shd_warp_t *>::const_iterator iter = lrr_order.begin();
+         iter != lrr_order.end(); ++iter) {
+      shd_warp_t *candidate_warp = *iter;
+      unsigned candidate_distance = 3;
+      if (candidate_warp != NULL && !candidate_warp->done_exit() &&
+          !candidate_warp->waiting() && !candidate_warp->ibuffer_empty()) {
+        const warp_inst_t *inst = candidate_warp->ibuffer_next_inst();
+        if (inst) {
+          candidate_distance =
+              cluster_distance(m_prev_cluster, cluster_of(inst->rank));
+        }
+      }
+      if (candidate_distance == distance) {
+        m_next_cycle_prioritized_warps.push_back(candidate_warp);
+      }
     }
   }
 }

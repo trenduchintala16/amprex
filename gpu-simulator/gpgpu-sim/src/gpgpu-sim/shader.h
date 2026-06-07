@@ -373,6 +373,7 @@ enum concrete_scheduler {
   CONCRETE_SCHEDULER_WARP_LIMITING,
   CONCRETE_SCHEDULER_OLDEST_FIRST,
   CONCRETE_SCHEDULER_AMPREX,
+  CONCRETE_SCHEDULER_AMPREX_LOOKAHEAD,
   NUM_CONCRETE_SCHEDULERS
 };
 
@@ -462,6 +463,10 @@ class scheduler_unit {  // this can be copied freely, so can be used in std
       unsigned warp_id, unsigned num_issued,
       const std::vector<shd_warp_t *>::const_iterator &prioritized_iter,
       InstrRank issued_rank);
+  virtual unsigned get_switch_delay_cycles(SwitchType sw, int prev_cluster,
+                                           int curr_cluster,
+                                           unsigned long long run_len,
+                                           unsigned *hidden_cycles) const;
   inline int get_sid() const;
 
  protected:
@@ -579,6 +584,28 @@ class amprex_scheduler : public scheduler_unit {
   virtual void done_adding_supervised_warps() {
     m_last_supervised_issued = m_supervised_warps.end();
   }
+};
+
+class amprex_lookahead_scheduler : public amprex_scheduler {
+ public:
+  amprex_lookahead_scheduler(shader_core_stats *stats, shader_core_ctx *shader,
+                             Scoreboard *scoreboard, simt_stack **simt,
+                             std::vector<shd_warp_t *> *warp,
+                             register_set *sp_out, register_set *dp_out,
+                             register_set *sfu_out, register_set *int_out,
+                             register_set *tensor_core_out,
+                             std::vector<register_set *> &spec_cores_out,
+                             register_set *mem_out, int id)
+      : amprex_scheduler(stats, shader, scoreboard, simt, warp, sp_out, dp_out,
+                         sfu_out, int_out, tensor_core_out, spec_cores_out,
+                         mem_out, id) {}
+  virtual ~amprex_lookahead_scheduler() {}
+
+ protected:
+  virtual unsigned get_switch_delay_cycles(SwitchType sw, int prev_cluster,
+                                           int curr_cluster,
+                                           unsigned long long run_len,
+                                           unsigned *hidden_cycles) const;
 };
 
 class oldest_scheduler : public scheduler_unit {
@@ -1056,13 +1083,17 @@ class opndcoll_rfu_t {  // operand collector based register file unit
         unsigned cusPerSched = m_num_collectors / m_num_warp_scheds;
         unsigned rr_increment =
             m_sub_core_model ? cusPerSched - (m_last_cu % cusPerSched) : 1;
-        for (unsigned n = 0; n < m_num_collectors; n++) {
-          unsigned c = (m_last_cu + n + rr_increment) % m_num_collectors;
-          if ((*m_collector_units)[c].ready() &&
-              (*m_collector_units)[c].get_cluster() == m_prev_cluster) {
-            m_last_cu = c;
-            m_prev_cluster = (*m_collector_units)[c].get_cluster();
-            return &((*m_collector_units)[c]);
+        for (unsigned distance = 0; distance <= 3; distance++) {
+          for (unsigned n = 0; n < m_num_collectors; n++) {
+            unsigned c = (m_last_cu + n + rr_increment) % m_num_collectors;
+            if ((*m_collector_units)[c].ready() &&
+                cluster_distance(m_prev_cluster,
+                                 (*m_collector_units)[c].get_cluster()) ==
+                    distance) {
+              m_last_cu = c;
+              m_prev_cluster = (*m_collector_units)[c].get_cluster();
+              return &((*m_collector_units)[c]);
+            }
           }
         }
       }
@@ -2004,6 +2035,12 @@ class shader_core_stats : public shader_core_stats_pod {
     rank_switch_delay_cycles =
         (unsigned long long *)calloc(config->gpgpu_num_sched_per_core,
                                      sizeof(unsigned long long));
+    rank_switch_base_delay_cycles =
+        (unsigned long long *)calloc(config->gpgpu_num_sched_per_core,
+                                     sizeof(unsigned long long));
+    rank_switch_hidden_delay_cycles =
+        (unsigned long long *)calloc(config->gpgpu_num_sched_per_core,
+                                     sizeof(unsigned long long));
 
     medium_switch_distance_sum = (unsigned long long *)calloc(config->gpgpu_num_sched_per_core,
                         sizeof(unsigned long long));
@@ -2072,6 +2109,8 @@ class shader_core_stats : public shader_core_stats_pod {
     free(rank_switch_medium);
     free(rank_switch_large);
     free(rank_switch_delay_cycles);
+    free(rank_switch_base_delay_cycles);
+    free(rank_switch_hidden_delay_cycles);
     free(medium_switch_distance_sum);
     free(medium_switch_count);
     free(large_switch_distance_sum);
@@ -2112,6 +2151,8 @@ class shader_core_stats : public shader_core_stats_pod {
   unsigned long long *rank_switch_medium;
   unsigned long long *rank_switch_large;
   unsigned long long *rank_switch_delay_cycles;
+  unsigned long long *rank_switch_base_delay_cycles;
+  unsigned long long *rank_switch_hidden_delay_cycles;
 
   unsigned long long *medium_switch_distance_sum;
   unsigned long long *medium_switch_count;
