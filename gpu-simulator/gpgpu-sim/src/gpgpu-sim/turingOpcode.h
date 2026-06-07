@@ -18,6 +18,12 @@ enum class InstrRank : uint8_t {
     UNKNOWN = 255
 };
 
+enum class SwitchType : uint8_t {
+    NO = 0,
+    MEDIUM = 1,
+    LARGE = 2
+};
+
 // Opcode -> rank mapping for Turing / sm_75 traces.
 // This is intentionally conservative: many instructions are grouped by
 // functional class rather than trying to overfit per-opcode power.
@@ -115,6 +121,35 @@ static const std::unordered_map<std::string, InstrRank> kOpcodeToRank = {
 inline InstrRank get_rank(const std::string& opcode) {
     auto it = kOpcodeToRank.find(opcode);
     return (it == kOpcodeToRank.end()) ? InstrRank::UNKNOWN : it->second;
+}
+
+
+
+inline int cluster_of(InstrRank r) {
+    switch (r) {
+        case InstrRank::RANK_0:
+        case InstrRank::RANK_1:
+        case InstrRank::RANK_2:
+            return 0; // low
+        case InstrRank::RANK_3:
+        case InstrRank::RANK_4:
+            return 1; // middle
+        case InstrRank::RANK_5:
+        case InstrRank::RANK_6:
+            return 2; // high
+        default:
+            return -1;
+    }
+}
+
+inline SwitchType classify_switch(InstrRank prev, InstrRank curr) {
+    int p = cluster_of(prev);
+    int c = cluster_of(curr);
+
+    if (p < 0 || c < 0) return SwitchType::NO;
+    if (p == c) return SwitchType::NO;
+    if ((p == 0 && c == 2) || (p == 2 && c == 0)) return SwitchType::LARGE;
+    return SwitchType::MEDIUM;
 }
 
 #endif  // TURING_OPCODE_RANK_H
